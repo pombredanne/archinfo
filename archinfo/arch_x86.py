@@ -1,14 +1,139 @@
-import capstone as _capstone
+import logging
 
-from .arch import Arch
+l = logging.getLogger("archinfo.arch_x86")
+
+try:
+    import capstone as _capstone
+except ImportError:
+    _capstone = None
+
+try:
+    import keystone as _keystone
+except ImportError:
+    _keystone = None
+
+try:
+    import unicorn as _unicorn
+except ImportError:
+    _unicorn = None
+
+from .arch import Arch, register_arch, Endness
+from .tls import TLSArchInfo
 from .archerror import ArchError
 
 class ArchX86(Arch):
-    def __init__(self, endness='Iend_LE'):
-        if endness != 'Iend_LE':
+    def __init__(self, endness=Endness.LE):
+        if endness != Endness.LE:
             raise ArchError('Arch i386 must be little endian')
         super(ArchX86, self).__init__(endness)
-        self.vex_archinfo['x86_cr0'] = 0xFFFFFFFF
+        if self.vex_archinfo:
+            self.vex_archinfo['x86_cr0'] = 0xFFFFFFFF
+
+    @property
+    def capstone(self):
+        if _capstone is None:
+            l.warning("Capstone is not found!")
+            return None
+        if self.cs_arch is None:
+            raise ArchError("Arch %s does not support disassembly with Capstone" % self.name)
+        if self._cs is None:
+            self._cs = _capstone.Cs(self.cs_arch, self.cs_mode)
+            self._cs.syntax = _capstone.CS_OPT_SYNTAX_ATT if self._cs_x86_syntax == 'at&t' else _capstone.CS_OPT_SYNTAX_INTEL
+            self._cs.detail = True
+        return self._cs
+
+    @property
+    def capstone_x86_syntax(self):
+        """
+        Get the current syntax Capstone uses for x86. It can be 'intel' or 'at&t'
+
+        :return: Capstone's current x86 syntax
+        :rtype: str
+        """
+
+        return self._cs_x86_syntax
+
+    @capstone_x86_syntax.setter
+    def capstone_x86_syntax(self, new_syntax):
+        """
+        Set the syntax that Capstone outputs for x86.
+        """
+
+        if new_syntax not in ('intel', 'at&t'):
+            raise ArchError('Unsupported Capstone x86 syntax. It must be either "intel" or "at&t".')
+
+        if new_syntax != self._cs_x86_syntax:
+            # clear the existing Capstone instance
+            self._cs = None
+            self._cs_x86_syntax = new_syntax
+
+    @property
+    def keystone_x86_syntax(self):
+        """
+        Get the current syntax Keystone uses for x86. It can be 'intel',
+        'at&t', 'nasm', 'masm', 'gas' or 'radix16'
+
+        :return: Keystone's current x86 syntax
+        :rtype: str
+        """
+
+        return self._ks_x86_syntax
+
+    @keystone_x86_syntax.setter
+    def keystone_x86_syntax(self, new_syntax):
+        """
+        Set the syntax that Keystone uses for x86.
+        """
+
+        if new_syntax not in ('intel', 'at&t', 'nasm', 'masm', 'gas', 'radix16'):
+            e_str = 'Unsupported Keystone x86 syntax. It must be one of the following: '
+            e_str += '"intel", "at&t", "nasm", "masm", "gas" or "radix16".'
+            raise ArchError(e_str)
+
+        if new_syntax != self._ks_x86_syntax:
+            # clear the existing keystone instance
+            self._ks = None
+            self._ks_x86_syntax = new_syntax
+
+    def asm(self, string, addr=0, as_bytes=True, thumb=False):
+        """
+        Compile the assembly instruction represented by string using Keystone
+
+        :param string:      The textual assembly instructions, separated by semicolons
+        :param addr:        The address at which the text should be assembled, to deal with PC-relative access. Default 0
+        :param as_bytes:    Set to False to return a list of integers instead of a python byte string
+        :param thumb:       If working with an ARM processor, set to True to assemble in thumb mode.
+        :return:            The assembled bytecode
+        """
+        if thumb is True:
+            l.warning("Specified thumb=True on non-ARM architecture")
+        if _keystone is None:
+            l.warning("Keystone is not found!")
+            return None
+        if self.ks_arch is None:
+            raise ArchError("Arch %s does not support assembly with Keystone" % self.name)
+        if self._ks is None:
+            self._ks = _keystone.Ks(self.ks_arch, self.ks_mode)
+            self._ks.syntax = _keystone.KS_OPT_SYNTAX_INTEL
+            if self._ks_x86_syntax == 'at&t':
+                self._ks.syntax = _keystone.KS_OPT_SYNTAX_ATT
+            elif self._ks_x86_syntax == 'nasm':
+                self._ks.syntax = _keystone.KS_OPT_SYNTAX_NASM
+            elif self._ks_x86_syntax == 'masm':
+                self._ks.syntax = _keystone.KS_OPT_SYNTAX_MASM
+            elif self._ks_x86_syntax == 'gas':
+                self._ks.syntax = _keystone.KS_OPT_SYNTAX_GAS
+            elif self._ks_x86_syntax == 'radix16':
+                self._ks.syntax = _keystone.KS_OPT_SYNTAX_RADIX16
+        try:
+            encoding, _ = self._ks.asm(string, addr, as_bytes) # pylint: disable=too-many-function-args
+        except TypeError:
+            bytelist, _ = self._ks.asm(string, addr)
+            if as_bytes:
+                encoding = ''.join(chr(c) for c in bytelist)
+            else:
+                encoding = bytelist
+        return encoding
 
     bits = 32
     vex_arch = "VexArchX86"
@@ -23,24 +148,45 @@ class ArchX86(Arch):
     sp_offset = 24
     bp_offset = 28
     ret_offset = 8
+    vex_conditional_helpers = True
     syscall_num_offset = 8
     call_pushes_ret = True
     stack_change = -4
-    memory_endness = "Iend_LE"
-    register_endness = "Iend_LE"
-    cs_arch = _capstone.CS_ARCH_X86
-    cs_mode = _capstone.CS_MODE_32 + _capstone.CS_MODE_LITTLE_ENDIAN
-    function_prologs = {
-        r"\x55\x8b\xec", # push ebp; mov ebp, esp
-        r"\x55\x89\xe5",  # push ebp; mov ebp, esp
-    }
+    memory_endness = Endness.LE
+    register_endness = Endness.LE
+    sizeof = {'short': 16, 'int': 32, 'long': 32, 'long long': 64}
+    if _capstone:
+        cs_arch = _capstone.CS_ARCH_X86
+        cs_mode = _capstone.CS_MODE_32 + _capstone.CS_MODE_LITTLE_ENDIAN
+    _cs_x86_syntax = None # Set it to 'att' in order to use AT&T syntax for x86
+    if _keystone:
+        ks_arch = _keystone.KS_ARCH_X86
+        ks_mode = _keystone.KS_MODE_32 + _keystone.KS_MODE_LITTLE_ENDIAN
+    _ks_x86_syntax = None
+    uc_arch = _unicorn.UC_ARCH_X86 if _unicorn else None
+    uc_mode = (_unicorn.UC_MODE_32 + _unicorn.UC_MODE_LITTLE_ENDIAN) if _unicorn else None
+    uc_const = _unicorn.x86_const if _unicorn else None
+    uc_prefix = "UC_X86_" if _unicorn else None
+    function_prologs = [
+        br"\x8b\xff\x55\x8b\xec", # mov edi, edi; push ebp; mov ebp, esp
+        br"\x55\x8b\xec", # push ebp; mov ebp, esp
+        br"\x55\x89\xe5",  # push ebp; mov ebp, esp
+        br"\x55\x57\x56",  # push ebp; push edi; push esi
+        # mov eax, 0x000000??; (push ebp; push eax; push edi; push ebx; push esi; push edx; push ecx) sub esp
+        br"\xb8[\x00-\xff]\x00\x00\x00[\x50\x51\x52\x53\x55\x56\x57]{0,7}\x8b[\x00-\xff]{2}",
+        # (push ebp; push eax; push edi; push ebx; push esi; push edx; push ecx) sub esp
+        br"[\x50\x51\x52\x53\x55\x56\x57]{1,7}\x83\xec[\x00-\xff]{2,4}",
+        # (push ebp; push eax; push edi; push ebx; push esi; push edx; push ecx) mov xxx, xxx
+        br"[\x50\x51\x52\x53\x55\x56\x57]{1,7}\x8b[\x00-\xff]{2}",
+        br"(\x81|\x83)\xec",  # sub xxx %esp
+    ]
     function_epilogs = {
-        r"\xc9\xc3", # leave; ret
-        r"([^\x41][\x50-\x5f]{1}|\x41[\x50-\x5f])\xc3", # pop <reg>; ret
-        r"[^\x48][\x83,\x81]\xc4([\x00-\xff]{1}|[\x00-\xff]{4})\xc3", #  add esp, <siz>; retq
+        br"\xc9\xc3", # leave; ret
+        br"([^\x41][\x50-\x5f]{1}|\x41[\x50-\x5f])\xc3", # pop <reg>; ret
+        br"[^\x48][\x83,\x81]\xc4([\x00-\xff]{1}|[\x00-\xff]{4})\xc3", #  add esp, <siz>; retq
     }
-    ret_instruction = "\xc3"
-    nop_instruction = "\x90"
+    ret_instruction = b"\xc3"
+    nop_instruction = b"\x90"
     instruction_alignment = 1
     default_register_values = [
         ( 'esp', Arch.initial_sp, True, 'global' ), # the stack
@@ -50,67 +196,48 @@ class ArchX86(Arch):
         ( 'gdt', 0, False, None ),
         ( 'ldt', 0, False, None ),
         ( 'id', 1, False, None ),
-        ( 'ac', 0, False, None )
+        ( 'ac', 0, False, None ),
+        ( 'ftop', 0, False, None ),
+        ( 'fpu_tags', 0, False, None),
+        ( 'fs', 0, False, None),
+        ( 'gs', 0, False, None),
+        ( 'cc_op', 0, False, None), # Set cc_op to OP_COPY by default making cc_dep1 effectively the flags register
     ]
     entry_register_values = {
         'eax': 0x1C,
         'edx': 'ld_destructor',
         'ebp': 0
     }
-    default_symbolic_registers = [ 'eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi', 'eip' ]
+    default_symbolic_registers = [ 'eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi' ]
     register_names = {
         8: 'eax',
         12: 'ecx',
         16: 'edx',
         20: 'ebx',
-
         24: 'esp',
-
         28: 'ebp',
         32: 'esi',
         36: 'edi',
-
-        # condition stuff
         40: 'cc_op',
         44: 'cc_dep1',
         48: 'cc_dep2',
         52: 'cc_ndep',
-
-        # this determines which direction SSE instructions go
         56: 'd',
-
-        # separately-stored bits of eflags
         60: 'id',
         64: 'ac',
-
         68: 'eip',
-
-        # fpu registers
-        72: 'st0',
-        80: 'st1',
-        88: 'st2',
-        96: 'st2',
-        104: 'st4',
-        112: 'st5',
-        120: 'st6',
-        128: 'st7',
-
-        # fpu tags
-        136: 'fpu_t0',
-        137: 'fpu_t1',
-        138: 'fpu_t2',
-        139: 'fpu_t3',
-        140: 'fpu_t4',
-        141: 'fpu_t5',
-        142: 'fpu_t6',
-        143: 'fpu_t7',
-
-        # fpu settings
+        72: 'mm0',
+        80: 'mm1',
+        88: 'mm2',
+        96: 'mm3',
+        104: 'mm4',
+        112: 'mm5',
+        120: 'mm6',
+        128: 'mm7',
+        136: 'fpu_tags',
         144: 'fpround',
         148: 'fc3210',
         152: 'ftop',
-
-        # sse
         156: 'sseround',
         160: 'xmm0',
         176: 'xmm1',
@@ -120,58 +247,64 @@ class ArchX86(Arch):
         240: 'xmm5',
         256: 'xmm6',
         272: 'xmm7',
-
         288: 'cs',
         290: 'ds',
         292: 'es',
         294: 'fs',
         296: 'gs',
         298: 'ss',
-
         304: 'ldt',
-        312: 'gdt'
+        312: 'gdt',
+        320: 'emnote',
+        324: 'cmstart',
+        328: 'cmlen',
+        332: 'nraddr',
+        336: 'sc_class',
+        340: 'ip_at_syscall',
     }
 
     registers = {
+        'ah': (9, 1),
+        'al': (8, 1),
+        'ax': (8, 2),
         'eax': (8, 4),
+        'ch': (13, 1),
+        'cl': (12, 1),
+        'cx': (12, 2),
         'ecx': (12, 4),
+        'dh': (17, 1),
+        'dl': (16, 1),
+        'dx': (16, 2),
         'edx': (16, 4),
+        'bh': (21, 1),
+        'bl': (20, 1),
+        'bx': (20, 2),
         'ebx': (20, 4),
-
-        'sp': (24, 4),
         'esp': (24, 4),
-
-        'ebp': (28, 4), 'bp': (28, 4),
+        'sp': (24, 4),
+        'bp': (28, 4),
+        'ebp': (28, 4),
+        'sih': (33, 1),
+        'sil': (32, 1),
+        'si': (32, 2),
         'esi': (32, 4),
+        'dih': (37, 1),
+        'dil': (36, 1),
+        'di': (36, 2),
         'edi': (36, 4),
-
-        # condition stuff
         'cc_op': (40, 4),
         'cc_dep1': (44, 4),
         'cc_dep2': (48, 4),
         'cc_ndep': (52, 4),
-
-        # this determines which direction SSE instructions go
         'd': (56, 4),
-
-        # separately-stored bits of eflags
+        'dflag': (56, 4),
         'id': (60, 4),
+        'idflag': (60, 4),
         'ac': (64, 4),
-
+        'acflag': (64, 4),
         'eip': (68, 4),
-        'pc': (68, 4),
         'ip': (68, 4),
-
-        # fpu registers and mmx aliases
-        'fpu_regs': (72, 64),
-        'st0': (72, 8),
-        'st1': (80, 8),
-        'st2': (88, 8),
-        'st3': (96, 8),
-        'st4': (104, 8),
-        'st5': (112, 8),
-        'st6': (120, 8),
-        'st7': (128, 8),
+        'pc': (68, 4),
         'mm0': (72, 8),
         'mm1': (80, 8),
         'mm2': (88, 8),
@@ -180,24 +313,13 @@ class ArchX86(Arch):
         'mm5': (112, 8),
         'mm6': (120, 8),
         'mm7': (128, 8),
-
-        # fpu tags
+        'fpreg': (72, 64),
+        'fpu_regs': (72, 64),
+        'fptag': (136, 8),
         'fpu_tags': (136, 8),
-        'fpu_t0': (136, 1),
-        'fpu_t1': (137, 1),
-        'fpu_t2': (138, 1),
-        'fpu_t3': (139, 1),
-        'fpu_t4': (140, 1),
-        'fpu_t5': (141, 1),
-        'fpu_t6': (142, 1),
-        'fpu_t7': (143, 1),
-
-        # fpu settings
         'fpround': (144, 4),
         'fc3210': (148, 4),
         'ftop': (152, 4),
-
-        # sse
         'sseround': (156, 4),
         'xmm0': (160, 16),
         'xmm1': (176, 16),
@@ -207,7 +329,6 @@ class ArchX86(Arch):
         'xmm5': (240, 16),
         'xmm6': (256, 16),
         'xmm7': (272, 16),
-
         'cs': (288, 2),
         'ds': (290, 2),
         'es': (292, 2),
@@ -215,7 +336,13 @@ class ArchX86(Arch):
         'gs': (296, 2),
         'ss': (298, 2),
         'ldt': (304, 8),
-        'gdt': (312, 8)
+        'gdt': (312, 8),
+        'emnote': (320, 4),
+        'cmstart': (324, 4),
+        'cmlen': (328, 4),
+        'nraddr': (332, 4),
+        'sc_class': (336, 4),
+        'ip_at_syscall': (340, 4),
     }
 
     argument_registers = { registers['eax'][0],
@@ -226,6 +353,13 @@ class ArchX86(Arch):
                            registers['esi'][0],
                            registers['edi'][0] }
 
+    symbol_type_translation = {
+        10: 'STT_GNU_IFUNC',
+        'STT_LOOS': 'STT_GNU_IFUNC'
+    }
     lib_paths = ['/lib32', '/usr/lib32']
     got_section_name = '.got.plt'
     ld_linux_name = 'ld-linux.so.2'
+    elf_tls = TLSArchInfo(2, 56, [8], [4], [0], 0, 0)
+
+register_arch([r'.*i?\d86|.*x32|.*x86|.*metapc'], 32, Endness.LE, ArchX86)

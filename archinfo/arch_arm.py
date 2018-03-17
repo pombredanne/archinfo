@@ -1,22 +1,40 @@
-import capstone as _capstone
+import logging
 
-from .arch import Arch
+l = logging.getLogger("archinfo.arch_arm")
+
+try:
+    import capstone as _capstone
+except ImportError:
+    _capstone = None
+
+try:
+    import keystone as _keystone
+except ImportError:
+    _keystone = None
+
+try:
+    import unicorn as _unicorn
+except ImportError:
+    _unicorn = None
+
+from .arch import Arch, register_arch, Endness, ArchError
+from .tls import TLSArchInfo
 
 # TODO: determine proper base register (if it exists)
 # TODO: handle multiple return registers?
 # TODO: which endianness should be default?
 
 class ArchARM(Arch):
-    def __init__(self, endness="Iend_LE"):
+    def __init__(self, endness=Endness.LE):
         super(ArchARM, self).__init__(endness)
-        if endness == 'Iend_BE':
+        if endness == Endness.BE:
             self.function_prologs = {
-                r"\xe9\x2d[\x00-\xff][\x00-\xff]",          # stmfd sp!, {xxxxx}
-                r"\xe5\x2d\xe0\x04",                        # push {lr}
+                br"\xe9\x2d[\x00-\xff][\x00-\xff]",          # stmfd sp!, {xxxxx}
+                br"\xe5\x2d\xe0\x04",                        # push {lr}
             }
             self.function_epilogs = {
-                r"\xe8\xbd[\x00-\xff]{2}\xe1\x2f\xff\x1e"   # pop {xxx}; bx lr
-                r"\xe4\x9d\xe0\x04\xe1\x2f\xff\x1e"         # pop {xxx}; bx lr
+                br"\xe8\xbd[\x00-\xff]{2}\xe1\x2f\xff\x1e"   # pop {xxx}; bx lr
+                br"\xe4\x9d\xe0\x04\xe1\x2f\xff\x1e"         # pop {xxx}; bx lr
             }
 
     # ArchARM will match with any ARM, but ArchARMEL/ArchARMHF is a mismatch
@@ -35,6 +53,8 @@ class ArchARM(Arch):
     def __getstate__(self):
         self._cs = None
         self._cs_thumb = None
+        self._ks = None
+        self._ks_thumb = None
         return self.__dict__
 
     def __setstate__(self, data):
@@ -42,6 +62,11 @@ class ArchARM(Arch):
 
     @property
     def capstone(self):
+        if _capstone is None:
+            l.warning("Capstone is not found!")
+            return None
+        if self.cs_arch is None:
+            raise ArchError("Arch %s does not support disassembly with Capstone" % self.name)
         if self._cs is None:
             self._cs = _capstone.Cs(self.cs_arch, self.cs_mode + _capstone.CS_MODE_ARM)
             self._cs.detail = True
@@ -49,11 +74,49 @@ class ArchARM(Arch):
 
     @property
     def capstone_thumb(self):
+        if self.cs_arch is None:
+            raise ArchError("Arch %s does not support disassembly with Capstone" % self.name)
         if self._cs_thumb is None:
             self._cs_thumb = _capstone.Cs(self.cs_arch, self.cs_mode + _capstone.CS_MODE_THUMB)
             self._cs_thumb.detail = True
         return self._cs_thumb
 
+    def asm(self, string, addr=0, as_bytes=True, thumb=False):
+        """
+        Compile the assembly instruction represented by string using Keystone
+
+        :param string:      The textual assembly instructions, separated by semicolons
+        :param addr:        The address at which the text should be assembled, to deal with PC-relative access. Default 0
+        :param as_bytes:    Set to False to return a list of integers instead of a python byte string
+        :param thumb:       If working with an ARM processor, set to True to assemble in thumb mode.
+        :return:            The assembled bytecode
+        """
+        if _keystone is None:
+            l.warning("Keystone is not found!")
+            return None
+        if self.ks_arch is None:
+            raise ArchError("Arch %s does not support assembly with Keystone" % self.name)
+        if self._ks is None or self._ks_thumb != thumb:
+            self._ks_thumb = thumb
+            mode = _keystone.KS_MODE_THUMB if thumb else _keystone.KS_MODE_ARM
+            self._ks = _keystone.Ks(self.ks_arch, self.ks_mode + mode)
+        try:
+            encoding, _ = self._ks.asm(string, addr, as_bytes) # pylint: disable=too-many-function-args
+        except TypeError:
+            bytelist, _ = self._ks.asm(string, addr)
+            if as_bytes:
+                encoding = ''.join(chr(c) for c in bytelist)
+            else:
+                encoding = bytelist
+        return encoding
+
+    @property
+    def unicorn(self):
+        return _unicorn.Uc(self.uc_arch, self.uc_mode + _unicorn.UC_MODE_ARM) if _unicorn is not None else None
+
+    @property
+    def unicorn_thumb(self):
+        return _unicorn.Uc(self.uc_arch, self.uc_mode + _unicorn.UC_MODE_THUMB) if _unicorn is not None else None
 
     bits = 32
     vex_arch = "VexArchARM"
@@ -67,36 +130,53 @@ class ArchARM(Arch):
     sp_offset = 60
     bp_offset = 60
     ret_offset = 8
+    lr_offset = 64
+    vex_conditional_helpers = True
     syscall_num_offset = 36
     call_pushes_ret = False
     stack_change = -4
-    memory_endness = 'Iend_LE'
-    register_endness = 'Iend_LE'
-    cs_arch = _capstone.CS_ARCH_ARM
-    cs_mode = _capstone.CS_MODE_LITTLE_ENDIAN
+    memory_endness = Endness.LE
+    register_endness = Endness.LE
+    sizeof = {'short': 16, 'int': 32, 'long': 32, 'long long': 64}
+    if _capstone:
+        cs_arch = _capstone.CS_ARCH_ARM
+        cs_mode = _capstone.CS_MODE_LITTLE_ENDIAN
     _cs_thumb = None
-    #self.ret_instruction = "\x0E\xF0\xA0\xE1" # this is mov pc, lr
-    ret_instruction = "\x1E\xFF\x2F\xE1" # this is bx lr
-    nop_instruction = "\x00\x00\x00\x00"
+    if _keystone:
+        ks_arch = _keystone.KS_ARCH_ARM
+        ks_mode = _keystone.KS_MODE_LITTLE_ENDIAN
+    _ks_thumb = None
+    uc_arch = _unicorn.UC_ARCH_ARM if _unicorn else None
+    uc_mode = _unicorn.UC_MODE_LITTLE_ENDIAN if _unicorn else None
+    uc_const = _unicorn.arm_const if _unicorn else None
+    uc_prefix = "UC_ARM_" if _unicorn else None
+    #self.ret_instruction = b"\x0E\xF0\xA0\xE1" # this is mov pc, lr
+    ret_instruction = b"\x1E\xFF\x2F\xE1" # this is bx lr
+    nop_instruction = b"\x00\x00\x00\x00"
     function_prologs = {
-        r"[\x00-\xff][\x00-\xff]\x2d\xe9",          # stmfd sp!, {xxxxx}
-        r"\x04\xe0\x2d\xe5",                        # push {lr}
+        br"[\x00-\xff][\x00-\xff]\x2d\xe9",          # stmfd sp!, {xxxxx}
+        br"\x04\xe0\x2d\xe5",                        # push {lr}
     }
     function_epilogs = {
-        r"[\x00-\xff]{2}\xbd\xe8\x1e\xff\x2f\xe1"   # pop {xxx}; bx lr
-        r"\x04\xe0\x9d\xe4\x1e\xff\x2f\xe1"         # pop {xxx}; bx lr
+        br"[\x00-\xff]{2}\xbd\xe8\x1e\xff\x2f\xe1"   # pop {xxx}; bx lr
+        br"\x04\xe0\x9d\xe4\x1e\xff\x2f\xe1"         # pop {xxx}; bx lr
     }
-    instruction_alignment = 4
+    instruction_alignment = 2  # cuz there is also thumb mode
     concretize_unique_registers = {64}
     default_register_values = [
         ( 'sp', Arch.initial_sp, True, 'global' ),      # the stack
-        ( 'itstate', 0x00000000, False, None )              # part of the thumb conditional flags
+        ( 'itstate', 0x00000000, False, None ),         # part of the thumb conditional flags
+        ( 'cc_op', 0, False, None ),
+        ( 'cc_dep1', 0, False, None ),
+        ( 'cc_dep2', 0, False, None ),
+        ( 'cc_ndep', 0, False, None ),
     ]
     entry_register_values = {
         'r0': 'ld_destructor'
     }
 
-    default_symbolic_registers = [ 'r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'r7', 'r8', 'r9', 'r10', 'r11', 'r12', 'sp', 'lr', 'pc' ]
+    default_symbolic_registers = [ 'r0', 'r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'r7', 'r8', 'r9', 'r10', 'r11', 'r12',
+                                   'sp', 'lr', 'pc' ]
 
     register_names = {
         8: 'r0',
@@ -112,34 +192,23 @@ class ArchARM(Arch):
         48: 'r10',
         52: 'r11',
         56: 'r12',
-
-        # stack pointer
         60: 'sp',
-
-        # link register
         64: 'lr',
-
-        # program counter
         68: 'pc',
-
-        # condition stuff
         72: 'cc_op',
         76: 'cc_dep1',
         80: 'cc_dep2',
         84: 'cc_ndep',
-
         88: 'qflag32',
         92: 'geflag0',
         96: 'geflag1',
         100: 'geflag2',
         104: 'geflag3',
-
         108: 'emnote',
         112: 'cmstart',
         116: 'cmlen',
         120: 'nraddr',
         124: 'ip_at_syscall',
-
         128: 'd0',
         136: 'd1',
         144: 'd2',
@@ -172,14 +241,12 @@ class ArchARM(Arch):
         360: 'd29',
         368: 'd30',
         376: 'd31',
-
         384: 'fpscr',
         388: 'tpidruro',
-        392: 'itstate'
+        392: 'itstate',
     }
 
     registers = {
-        # GPRs
         'r0': (8, 4),
         'r1': (12, 4),
         'r2': (16, 4),
@@ -189,42 +256,36 @@ class ArchARM(Arch):
         'r6': (32, 4),
         'r7': (36, 4),
         'r8': (40, 4),
+        'sb': (44, 4),
         'r9': (44, 4),
+        'sl': (48, 4),
         'r10': (48, 4),
+        'fp': (52, 4),
         'r11': (52, 4),
         'r12': (56, 4),
-
-        # stack pointer
-        'sp': (60, 4), 'bp': (60, 4),
+        'bp': (60, 4),
         'r13': (60, 4),
-
-        # link register
-        'r14': (64, 4),
+        'sp': (60, 4),
         'lr': (64, 4),
-
-        # program counter
-        'r15': (68, 4),
-        'pc': (68, 4),
+        'r14': (64, 4),
         'ip': (68, 4),
-
-        # condition stuff
+        'pc': (68, 4),
+        'r15': (68, 4),
+        'r15t': (68, 4),
         'cc_op': (72, 4),
         'cc_dep1': (76, 4),
         'cc_dep2': (80, 4),
         'cc_ndep': (84, 4),
-
         'qflag32': (88, 4),
         'geflag0': (92, 4),
         'geflag1': (96, 4),
         'geflag2': (100, 4),
         'geflag3': (104, 4),
-
         'emnote': (108, 4),
         'cmstart': (112, 4),
         'cmlen': (116, 4),
         'nraddr': (120, 4),
         'ip_at_syscall': (124, 4),
-
         'd0': (128, 8),
         'd1': (136, 8),
         'd2': (144, 8),
@@ -257,10 +318,9 @@ class ArchARM(Arch):
         'd29': (360, 8),
         'd30': (368, 8),
         'd31': (376, 8),
-
         'fpscr': (384, 4),
         'tpidruro': (388, 4),
-        'itstate': (392, 4)
+        'itstate': (392, 4),
     }
 
     argument_registers = {
@@ -281,6 +341,9 @@ class ArchARM(Arch):
 
     got_section_name = '.got'
     ld_linux_name = 'ld-linux.so.3'
+    elf_tls = TLSArchInfo(1, 8, [], [0], [], 0, 0)
+    #elf_tls = TLSArchInfo(1, 32, [], [0], [], 0, 0)
+    # that line was lying in the original CLE code and I have no clue why it's different
 
 class ArchARMHF(ArchARM):
     name = 'ARMHF'
@@ -291,3 +354,9 @@ class ArchARMEL(ArchARM):
     name = 'ARMEL'
     triplet = 'arm-linux-gnueabi'
     ld_linux_name = 'ld-linux.so.3'
+    elf_tls = TLSArchInfo(1, 8, [], [0], [], 0, 0)
+
+register_arch([r'.*armhf.*'], 32, 'any', ArchARMHF)
+register_arch([r'.*armeb|.*armbe'], 32, Endness.BE, ArchARM)
+register_arch([r'.*armel|arm.*'], 32, Endness.LE, ArchARMEL)
+register_arch([r'.*arm.*|.*thumb.*'], 32, 'any', ArchARM)
